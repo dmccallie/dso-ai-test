@@ -1,4 +1,5 @@
 # data structured needed for AI planner and tools
+# contains structures for both the mult-agent and single-agent versions
 
 from dataclasses import dataclass
 from typing import Optional
@@ -20,12 +21,11 @@ import datetime
 # model_settings = OpenAIResponsesModelSettings(
 #     temperature = 0.4,
 #     openai_reasoning_effort="medium",
-#     # reasoning = { 'effort': "medium"    }
 # )
 
 model_string = "gemini-3-flash-preview"
 google_thinking_config = ThinkingConfigDict(
-        include_thoughts=True,
+        include_thoughts=False,
         thinking_budget=2000, # what does this mean?
     )
 model_settings = GoogleModelSettings(
@@ -49,7 +49,6 @@ class AstroDependencies:
     default_telescope: str = "Astrophysics 130EDF F6.3"
     default_camera: str = "ZWO ASI 2600MC Pro"
     db_path: str = "./dso_data.db"  # path to local deep space object database
-
 
 class Camera(BaseModel):
     name: str
@@ -146,6 +145,13 @@ class Plan(BaseModel):
     dsos: list[DeepSpaceObject] = Field(..., description="List of deep space objects to observe in this plan")
     equipment: Equipment = Field(..., description="The equipment to be used for the observation session")
     observer_context: ObserverContext = Field(..., description="The observer's context (lat, long, date, times) for the observation session")
+
+# single agent plan structure
+# this is based on returning observer context, equipment, and sql query string
+class SA_Plan(BaseModel):
+    observer_context: ObserverContext = Field(..., description="The observer's context (lat, long, date, times) for the observation session")
+    equipment: Equipment = Field(..., description="The equipment to be used for the observation session")
+    sql_query: str = Field(..., description="The generated SQL query string to find suitable deep space objects based on user criteria")
 
 class EquipmentQuery(BaseModel):
     text: str
