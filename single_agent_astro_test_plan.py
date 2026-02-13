@@ -11,11 +11,12 @@ from pydantic import BaseModel, Field
 from typing import Union
 from pathlib import Path
 
+from ai_astronomy_utils import ai_localize_and_fetch_dsos
 from ai_data_models import AstroDependencies, SA_Plan
 from ai_data_models import model_string, model_settings
 
 from agents import convert_local_day_and_time_to_utc_iso, infer_equipment_specs, \
-    infer_observer_context, return_dsos_observer_gear 
+    infer_observer_context, return_dsos_observer_gear , single_agent_astro_plan
     
 # fetch openai api key from env file
 import dotenv
@@ -33,195 +34,7 @@ logfire.configure()
 logfire.instrument_pydantic_ai()
 # logfire.instrument_httpx(capture_all=True)
 
-single_agent_astro_plan = Agent(
-    model_string,
-    model_settings=model_settings, 
-    system_prompt="""
-    You are a friendly expert helping the user plan amateur astronomy sessions.
 
-    When the user asks about planning a session, you should:
-     - First infer the ObserverContext (location, date, time). Defaults will be provided as Instructions at run time.
-     - Also infer the Equipment to be used(telescope, camera). Defaults will be provided as Instructions at run time.
-     - Finally, using the user's description of objects of interest, generate an SQL query to find suitable deep space objects.
-     - The return a Plan object containing the ObserverContext, Equipment, and the generated SQL query.
-     - Note that the user will run the SQL on a local database of deep space objects.
-
-    - Here are details about the database schema and how to generate the SQL query:
-
-     - Deep Space Object Table schema to be used for the SQL Select query:
-        CREATE TABLE dso_localized (
-            dso_id TEXT PRIMARY KEY,
-            catalog TEXT,
-            name TEXT,
-            ra_dd REAL,
-            dec_dd REAL,
-            type TEXT,
-            class TEXT,
-            vis_mag REAL,
-            maj_axis REAL,
-            min_axis REAL,
-            size TEXT,
-            constellation TEXT,
-            constellation_abbr TEXT,
-            altitude REAL,
-            azimuth REAL,
-            air_mass REAL,
-            rise_time TEXT, /* an ISO 8601 datetime string */
-            set_time TEXT, /* an ISO 8601 datetime string */
-            transit_time TEXT, /* an ISO 8601 datetime string */
-        );
-     - Note that "catalog" contains the catalog prefix as well as the catalog number or name, e.g., "M 31", "NGC 1976", etc.
-        So to fetch all Messier objects, the query would be: SELECT * FROM dso_localized WHERE catalog LIKE 'M %';
-        DSO classes are abbreviated as follows:
-        - Galaxy (Gal)
-        - Nebula (Neb)
-        - Cluster (Cls)
-        - DS (Double Star)
-        - Other (OTH)
-        DSO types are abbreviated as follows:
-        - Open Cluster (OC)
-        - Globular Cluster (GC)
-        - Planetary Nebula (PN)
-        - Emission Nebula (HII)
-        - Reflection Nebula (RN)
-        - Cluster Nebula (C+N)
-        - Dark Nebula (DN)
-        - Supernova Remnant (SNR)
-        - Galaxy (Gx)
-        - Other (OTH)
-
-     - If there is no ObserverContext provided by the user:
-          ignore altitude, azimuth, air_mass, rise_time, set_time, and transit_time fields in DeepSpaceObject. 
-
-      - Generated SQL should ONLY reference fields in the dso_localized table!
-
-      - ObserverContext values SHOULD NOT be directly included in the generated SQL query!
-       The dso_localized fields: altitude, azimuth, air_mass, rise_time, set_time, and transit_time
-        will have already been inserted into the dso_localized table already based on the ObserverContext.
-
-      - For example, if the user says:
-      "Using a RASA 8 and ZWO 2600, plan for nebula for a session in Chicago on March 15, 2024 where the targets are above 30 degrees altitude":,
-      you will infer the ObserverContext (location Chicago, date March 15, 2024),
-      then infer Equipment (Rasa 8 telescope, ZWO 2600 camera),
-      then you should generate a SQL query like:
-      
-        "SELECT * FROM dso_localized WHERE class LIKE '%Neb%' AND altitude > 30;":
-
-     - If the user specifies an alitude, azimuth, air mass or rise/set/transit times without an ObserverContext,
-         just ignore those constraints.
-
-     - If the user specifies distance measures for objects, consider these to be approximate angular distances
-        and use ra_dd and dec_dd fields to compute them. So for example if the user says:
-        "Find objects within 5 degrees of RA 10h and Dec +20d",
-        first convert RA 10h to degrees (150 degrees), then
-        you should generate a SQL query like:
-            "SELECT * FROM dso_localized WHERE
-                SQRT(
-                    ( (ra_dd - 150.0) * COS(20.0 * PI() / 180.0) ) * 
-                    ( (ra_dd - 150.0) * COS(20.0 * PI() / 180.0) ) +
-                    (dec_dd - 20.0) * (dec_dd - 20.0)
-                ) <= 5.0
-            AND ... other criteria ... ;"
-       
-      - If the distance reference is an object in the catalog, use a subquery.
-        For example, "Find objects within 3 degrees of M 31",
-         you should generate a SQL query like:
-        SELECT d.*
-            FROM dso_localized AS d
-            CROSS JOIN (
-                SELECT ra_dd AS ref_ra,
-                    dec_dd AS ref_dec
-                FROM dso_localized
-                WHERE catalog = 'M 13'
-                LIMIT 1
-            ) AS ref
-            WHERE
-                -- angular separation (approx) in degrees
-                SQRT(
-                    ( (d.ra_dd - ref.ref_ra) * COS(ref.ref_dec * PI() / 180.0) ) * 
-                    ( (d.ra_dd - ref.ref_ra) * COS(ref.ref_dec * PI() / 180.0) ) +
-                    (d.dec_dd - ref.ref_dec) * (d.dec_dd - ref.ref_dec)
-                ) <= 3.0
-            AND ... other criteria ... ;
-
-       - If asked to find objects near the a named constellation, use the constellation's central RA/Dec coordinates
-       as the reference point for distance calculations.
-
-      - If asked to filter objects by rise/set/transit times, use the ISO 8601 datetime strings
-        in the rise_time, set_time, and transit_time fields. The database fields will be in UTC time.
-        For example, to find objects that rise before 10 PM local time on March 15, 2024 in Chicago (UTC-5):
-        - First convert 10 PM local time to UTC time (March 16, 2024 at 03:00 UTC)
-        - Then generate a SQL query like:
-        "SELECT * FROM dso_localized WHERE rise_time < '2024-03-16T03:00:00Z' AND ... other criteria ... ;"
-
-      - If the user does not specify a minumn altitude, assume 20 degrees as the minimum altitude for observable objects.
-      - There is no need to limit by azimuth, air mass, rise/set/transit times unless specifically requested by the user.
-      - There is no need to order the results unless specifically requested by the user.
-
-    - Here are instructions on extracting equipement details from user input:
-        - When the user provides a nickname, common abbreviation, or product name for astronomy equipment,
-            you should infer detailed specifications about specific telescopes and specific cameras.
-        - Your end goal is to find telescope focal length and f-ratio, and camera sensor size and pixel size.
-        - If there is only information for telescope or camera, return just that part.
-        - If you can only find partial information, return what you can.
-        - Default values will be provided as Instructions at run time.
-        - Do not make up values.
-
-    - Here are instructions on how to infer observer context from user input:
-        - From the user's textual description, extract or infer the following fields into the SA_Plan's ObserverContext:
-             location, latitude_deg, longitude_deg, observe_date, observe_time, and timezone.
-        - Follow these rules when inferring the ObserverContext:
-        - If the user provides a location, infer the latitude and longitude if possible..
-        - If the user provides a relative date like "tonight" or "this weekend", 
-            convert that to an actual date string using the default_date provided as a runtime instruction.
-            for example, if default_date is "2024-06-15" and user says "tonight", use "2024-06-15" as the date string.
-            If the user says "tomorrow" use "2024-06-16". Do not use UTC dates.
-        - If the user provides an observation time like "22:00" capture that as observe_time.
-        - If the user provides a relative time like "now" or "in 2 hours", convert that to actual time string using default_time from the defaults.
-            for example, if the default_time is "14:30" and user says "in 2 hours", use "16:30" as the time string.
-         - Assume times are local times. Do not use UTC times.
-        - It is OK for the observe_time or observe_date to be in the past.
-        - If after considering details, any information that is missing or cannot be determined, 
-            use the defaults provided in the run-time instructions.
-
-    - The user's query may contain interative changes to the plan.
-        In that case, retain any prior context (ObserverContext, Equipment, etc.) unless the user explicitly changes it.
-    - User updates will be prefixed with "Update: " to indicate they are updates to earlier text in the user input.
-        - For example, if the user input is:
-                "Plan a session for galaxies and clusters in Leo on April 1, 2024 at 9 PM in New York using a Celestron 8 and ZWO 2600",
-                "Update: Now change it to include nebulae as well, and use a RASA 8 instead of the Celestron",
-                "Update: Also change the location to Chicago."
-          You would return galaxies, clusters, and nebulae observable from Chicago on April 1, 2024 at 9 PM using the RASA 8 and ZWO 2600.
-
-    """,
-    # this is a function call for output type.
-    # It will return to the user and skip sending the resuling DSO data to the LLM
-    # this does not need to listed in tools=[]
-    # output_type = [return_dsos_observer_gear],
-    output_type = SA_Plan,
-    # in order for tools to access context/deps, need to use Tool() with takes_ctx=True
-    # tools = [
-    #     Tool(infer_observer_context, takes_ctx=True),
-    #     Tool(infer_equipment_specs, takes_ctx=True),
-    #     # Tool(return_dsos_observer_gear, takes_ctx=True),
-    # ],
-    retries=2,
-    # deps is a member of RunContext, so will be accessible in tools via ctx.deps
-    deps_type=AstroDependencies
-)
-
-# provide run-time instructions based on default
-@single_agent_astro_plan.instructions
-async def custom_instructions(ctx: RunContext[AstroDependencies]) -> str:
-    return f"""
-    - Use the following run-time defaults when inferring missing date and time information:
-        - default date: {ctx.deps.default_date}
-        - default time: {ctx.deps.default_time}
-        - default timezone: {ctx.deps.default_timezone}
-    - Use the following run-time defaults when inferring missing equipment information:
-        - default telescope: {ctx.deps.default_telescope}
-        - default camera: {ctx.deps.default_camera}
-    """
 
 async def main() -> None:
     """Run a tiny REPL so we can test astro-agent."""
@@ -231,11 +44,11 @@ async def main() -> None:
     print("=== astro-agent demo ===")
     print("Type 'exit' or Ctrl+C to quit.\n")
 
-    prior_requests = []
+    user_requests = []
     while True:
         try:
-            if len(prior_requests) == 0:
-                new_msg = input("You, start: ")
+            if len(user_requests) == 0:
+                new_msg = input("Please enter anew query: ")
                 if new_msg.strip() == "":
                     continue
                 if new_msg.lower() in {"exit", "quit"}:
@@ -245,25 +58,32 @@ async def main() -> None:
                 # print("\nPrevious conversation:" )   
                 # for i, msg in enumerate(conversation):
                 #     print(f"{i+1}: {msg}")
-                new_msg = input("More?: ")
+                new_msg = input("Refine your query or return to start new query?: ")
                 if new_msg.strip() == "":
-                    prior_requests = []  # reset conversation on empty input
+                    user_requests = []  # reset conversation on empty input
                     print("Conversation reset.\n")
                     continue
 
-            prior_requests.append(new_msg)  
-            query = "\n Update: ".join([msg for msg in prior_requests])
-            query += " Otherwise no changes."
+            user_requests.append(new_msg)
+
+            # build query string. First message is the initial query, subsequent messages are updates to that query.
+            if len(user_requests) == 1:
+                query = user_requests[0]
+            else:
+                query = user_requests[0] + "\n"
+                for update in user_requests[1:]:
+                    query += "Update: " + update + "\n"
+                query += "Otherwise no updates to the initial query."
         
         except (EOFError, KeyboardInterrupt):
             print("\nBye!")
             break
 
         try:
-            if len(prior_requests) > 0:
+            if len(user_requests) > 0:
                 print("\n--- Continuing conversation with context ---\n")
                 print("Previous conversation:" )   
-                for i, msg in enumerate(prior_requests):
+                for i, msg in enumerate(user_requests):
                     print(f"{i+1}: {msg[0:200]}")
             else:
                 print("\n--- New conversation ---\n")
@@ -272,23 +92,55 @@ async def main() -> None:
             # tools must be registered with takes_ctx=True to access deps
             updated_deps = AstroDependencies(
                 # make sure these defaults are 'now' at runtime
+                # note this should be CLIENT "now" not server!
                     default_time=datetime.datetime.now(ZoneInfo("America/Chicago")).strftime("%H:%M"),
                     default_date=datetime.datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d"),
                     default_timezone="America/Chicago",
+                    default_location="Powell Observatory, Kansas", # this should be findable 
+                    # default_latitude=38.7076,
+                    # default_longitude=-94.7073,
+                    default_telescope="Astrophysics 130EDF F6.3",
+                    default_camera="ZWO ASI 2600MC Pro",
             )
             result = await single_agent_astro_plan.run(query, deps=updated_deps)
                             
             print("FINAL Bot Output --->:")
             if isinstance(result.output, SA_Plan):
-                if len(result.output.sql_query) == 0:
-                    print("Result: No SQL query was generated for the plan.")
-                else:
-                    print("Result Plan Deep Space Object Query:")
-                    print(result.output.sql_query)
-                    # for i, dso in enumerate(result.output.dsos):
-                    #     print(f"Result[{i}]: {dso.name} ({dso.catalog}), Type: {dso.type}, Class: {dso.clasz}, Mag: {dso.vis_mag}, Size: {dso.size}, Constellation: {dso.constellation}, Altitude: {dso.altitude}, Azimuth: {dso.azimuth}")
+
+                print(f"Generated query: {result.output.sql_query}")
                 print(f"Equipment included in plan: {result.output.equipment}")
                 print(f"Observer Context included in plan: {result.output.observer_context}")
+                print(f"Is this a valid plan? {result.output.valid_plan}")
+
+                # test running the generated SQL query against local DB
+                db_path = Path(updated_deps.db_path)
+                latidude = result.output.observer_context.latitude_deg
+                longitude = result.output.observer_context.longitude_deg
+                if latidude is None or longitude is None:
+                    print("Cannot run local DSO query because latitude or longitude is missing in observer context.")
+                    continue
+                observe_date = result.output.observer_context.observe_date
+                observe_time = result.output.observer_context.observe_time
+                timezone = result.output.observer_context.timezone
+                if observe_date is None or observe_time is None or timezone is None:
+                    print("Cannot run local DSO query because observe date, time, or timezone is missing in observer context.")
+                    continue
+
+                dsl_results = ai_localize_and_fetch_dsos(
+                    result.output.sql_query,
+                    db_path,
+                    latidude,
+                    longitude,
+                    observe_date,
+                    observe_time,
+                    timezone,
+                )
+                print(f"DSO Query Results ({len(dsl_results)} objects):")
+                for i, dso in enumerate(dsl_results):
+                    print(f"{i+1} - {dso['name']} ({dso['catalog']}) ({dso['class']} {dso['type']}), Altitude: {dso['altitude']:.1f} deg, Azimuth: {dso['azimuth']:.1f} deg")
+                    # pairs = [item for item in dso.items()]
+                    # print("  " + ", ".join([f"{k}: {v}" for k, v in pairs]))                    
+            
             else:
                 print(f"Output was NOT a PLAN: {result.output}")
 

@@ -4,6 +4,7 @@
 
 from functools import cache
 from pathlib import Path
+from time import perf_counter
 from astropy import units as u
 from astropy.coordinates import SkyCoord, EarthLocation, AltAz
 from astropy.time import Time
@@ -988,7 +989,165 @@ def ai_localize_dso(ra:float, dec:float, observer_lat: float, observer_lon: floa
     return horizontal.altitude, horizontal.azimuth, airmass, visible, \
             rise_time_iso, transit_time_iso, set_time_iso
 
-def convert_utc_iso_to_local(iso_str: str, tzname: str) -> Optional[str]:
+import sqlite3
+from pathlib import Path
+def ai_localize_and_fetch_dsos(ai_query:str, db_path:Path, observer_lat: float, observer_lon: float,
+                            observe_date:str, observe_time: str, timezone:str) -> list[dict[str, str]]:
+    """ Create a temporary table with localized data for all DSOs
+            then run the ai-generated sql query against the temp table
+            then return the list of DSO dicts matching the query with localization data included.  
+        Note that in web context we have to start from scratch each time, since no caching between calls
+        Do temp table creation in single transaction to keep it speedy.
+    """
+
+    # verify localization data (assumes caller has set up defaults if needed)
+
+    assert observer_lat is not None and observer_lon is not None, "Observer latitude and longitude must be provided."
+    assert observe_date is not None, "Observer date must be provided."
+    assert observe_time is not None, "Observer time must be provided."
+    assert timezone is not None, "Observer timezone must be provided."
+
+    # ensure we have no seconds in time string (AI puts them there sometimes)
+    if len(observe_time.split(":")) == 3:
+        observe_time = ":".join(observe_time.split(":")[0:2])
+
+    date_iso = f"{observe_date}T{observe_time}"
+    dt = datetime.strptime(f"{observe_date} {observe_time}", "%Y-%m-%d %H:%M")
+
+    # attach timezone
+    dt = dt.replace(tzinfo=ZoneInfo(timezone))
+    print(f"[ai_localize_and_fetch_dsos] recreate full datetime = {dt.isoformat()} for ({timezone})")
+
+    # create temp table
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # create a temporary in-memory table we can map localizations into
+        # make it match the DeepSpaceObject fields we want to fill in
+        start = perf_counter()
+        cursor.execute('''
+            DROP TABLE IF EXISTS dso_localized;
+        ''')
+        
+        cursor.execute("""
+            CREATE TEMP TABLE dso_localized (    
+                dso_id TEXT PRIMARY KEY,
+                catalog TEXT,
+                name TEXT,
+                ra_dd REAL,
+                dec_dd REAL,
+                type TEXT,
+                class TEXT,
+                vis_mag REAL,
+                maj_axis REAL,
+                min_axis REAL,
+                size TEXT,
+                constellation TEXT,
+                constellation_abbr TEXT,
+                altitude REAL,
+                azimuth REAL,
+                air_mass REAL,
+                rise_time TEXT, /* iso format full datetime string for utc */
+                set_time TEXT, /* iso format full datetime string for utc */
+                transit_time TEXT /* iso format full datetime string for utc */
+            );
+        """)
+        cursor.execute("""
+                        
+            INSERT INTO dso_localized (dso_id, catalog, name, ra_dd, dec_dd, type, class, vis_mag, maj_axis, min_axis, size,
+                constellation, constellation_abbr, altitude, azimuth, air_mass, rise_time, set_time, transit_time)
+            SELECT dso_id, catalog, name, ra_dd, dec_dd, type, class, vis_mag, maj_axis, min_axis, size,
+                constellation, constellation_abbr, NULL, NULL, NULL, NULL, NULL, NULL
+            FROM dso;
+        """)
+    except Exception as e:
+        print(f"Error creating temporary localized DSO table: {e}")
+        return [{}]
+    
+    print(f"[ai_localize_and_fetch_dsos] Created temporary dso_localized table in {perf_counter() - start:.2f} seconds")
+
+    # fetch all the raw dso data from the temp table we just created
+    try:
+        cursor.execute("""
+            SELECT * from dso_localized;
+        """)
+        all_dsos = cursor.fetchall()
+
+    except Exception as e:
+        print(f"Error fetching raw DSOs from temp localized table: {e}")
+        return [{}]
+
+    conn.commit()
+    print(f"[ai_localize_and_fetch_dsos] Fetched {len(all_dsos)} DSOs for localization")
+
+    # now loop through all DSOs and compute localization data
+    try:
+        start = perf_counter()        
+        # open transaction - for now, insert row by row, try batching later if needed
+        conn.execute("BEGIN;")
+        #     
+        # for each DSO, compute localization based on observer_context if present
+        for dso_row in all_dsos:
+            # default values
+            altitude = None
+            azimuth = None
+            air_mass = None
+            rise_time = None
+            set_time = None
+            transit_time = None
+
+            # if observer_context has location compute localization
+            # we already created a datetime object 'dt' above
+            if observer_lat is not None and observer_lon is not None:
+
+                altitude, azimuth, air_mass, visible, rise_time, transit_time, set_time = \
+                  ai_localize_dso(dso_row['ra_dd'], dso_row['dec_dd'],
+                     observer_lat, observer_lon,
+                     dt.isoformat(), timezone)
+            
+            # insert into temp table using DSO id as key
+            cursor.execute("""
+                UPDATE dso_localized
+                SET altitude = ?, azimuth = ?, air_mass = ?, rise_time = ?, set_time = ?, transit_time = ?
+                WHERE dso_id = ?;
+                """, (
+                altitude,
+                azimuth,
+                air_mass,
+                rise_time,
+                set_time,
+                transit_time,
+                dso_row['dso_id']
+            ))
+            # print(f"[ai_localize_and_fetch_dsos] Localized DSO {dso_row['name']} (ID: {dso_row['dso_id']})")
+
+        # commit transaction
+        conn.commit()
+        print(f"[ai_localize_and_fetch_dsos] Localized all DSOs in {perf_counter() - start:.2f} seconds")
+    
+    except Exception as e:
+        conn.rollback()
+        print(f"Error localizing DSOs and updating temp table: {e}")
+        return [{}] 
+
+    # now finally run the AI-generated query against the temp table
+    try:
+        start = perf_counter()
+        print(f"[ai_localize_and_fetch_dsos] Running AI-generated query: {ai_query}")
+        cursor.execute(ai_query)
+        
+        # convert to real dicts since I think Sqlite.Row goes away when conneciton closed?
+        results = [dict(row) for row in cursor.fetchall()]
+
+        return results
+
+    except Exception as e:
+        print(f"Error running AI-generated query: {e}")
+        return [{}]
+
+def ai_convert_utc_iso_to_local(iso_str: str, tzname: str) -> Optional[str]:
     """Convert an ISO time string in UTC to local time string in given timezone."""
     if iso_str is None:
         return None

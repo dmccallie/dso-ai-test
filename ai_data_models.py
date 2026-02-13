@@ -33,18 +33,19 @@ model_settings = GoogleModelSettings(
     google_thinking_config=google_thinking_config
 )
 
+default_timezone = "America/Chicago" # for use in default defaults
 @dataclass
 # dependencies get shared to all tools and agents
 # at run time, update these values as needed
 class AstroDependencies:
     # various defaults for observer context
-    default_location: str = "Stilwell, KS"
-    default_latitude: float = 38.7076
-    default_longitude: float = -94.7073
+    default_location: str = "Powell Observatory, Kansas" # this should be findable and is near the default lat/long
+    default_latitude: float = 38.6463 # 38.7076
+    default_longitude: float = -94.7000 # -94.7073
     # FIXME this should reflect the browser not the server!
-    default_date: str = "2025-12-25" #datetime.datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d")
-    default_time: str = datetime.datetime.now(ZoneInfo("America/Chicago")).strftime("%H:%M") # now time in HH:MM
-    default_timezone: str = "America/Chicago"
+    default_date: str = datetime.datetime.now(ZoneInfo(default_timezone)).strftime("%Y-%m-%d")
+    default_time: str = datetime.datetime.now(ZoneInfo(default_timezone)).strftime("%H:%M") # now time in HH:MM
+    default_timezone: str = default_timezone
     # defaults for equipment
     default_telescope: str = "Astrophysics 130EDF F6.3"
     default_camera: str = "ZWO ASI 2600MC Pro"
@@ -148,7 +149,13 @@ class Plan(BaseModel):
 
 # single agent plan structure
 # this is based on returning observer context, equipment, and sql query string
+# SA means "single agent"
+# this approach replaced most of the above attempts at multi-agent structures, 
+#   but we keep those for now since they may be useful for future multi-agent versions
+# Just return the SQL query and the observer context and equipment info 
+#  flag the plan for validity to alert user
 class SA_Plan(BaseModel):
+    valid_plan: bool = Field(..., description="Whether the generated plan is valid and executable")
     observer_context: ObserverContext = Field(..., description="The observer's context (lat, long, date, times) for the observation session")
     equipment: Equipment = Field(..., description="The equipment to be used for the observation session")
     sql_query: str = Field(..., description="The generated SQL query string to find suitable deep space objects based on user criteria")
